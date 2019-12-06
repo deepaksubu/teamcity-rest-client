@@ -8,7 +8,9 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import org.apache.commons.codec.binary.Base64
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import retrofit.RequestInterceptor
 import retrofit.RestAdapter
 import retrofit.converter.GsonConverter
 import retrofit.mime.TypedString
@@ -31,12 +33,16 @@ private val LOG = LoggerFactory.getLogger("teamcity-rest-client")
 private val teamCityServiceDateFormat = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssZ", Locale.ENGLISH)
 
 internal fun createGuestAuthInstance(serverUrl: String): TeamCityInstanceImpl {
-    return TeamCityInstanceImpl(serverUrl.trimEnd('/'), "guestAuth", null, false)
+    return TeamCityInstanceImpl(serverUrl.trimEnd('/'), TeamcityAuthMethod.GUEST_AUTH, null, false)
+}
+
+internal fun createAccessTokenAuthInstance(serverUrl: String, accessToken: String): TeamCityInstanceImpl {
+    return TeamCityInstanceImpl(serverUrl.trimEnd('/'), TeamcityAuthMethod.ACCESS_TOKEN, accessToken, false)
 }
 
 internal fun createHttpAuthInstance(serverUrl: String, username: String, password: String): TeamCityInstanceImpl {
     val authorization = Base64.encodeBase64String("$username:$password".toByteArray())
-    return TeamCityInstanceImpl(serverUrl.trimEnd('/'), "httpAuth", authorization, false)
+    return TeamCityInstanceImpl(serverUrl.trimEnd('/'), TeamcityAuthMethod.HTTP_AUTH, authorization, false)
 }
 
 private class RetryInterceptor : Interceptor {
@@ -47,7 +53,7 @@ private class RetryInterceptor : Interceptor {
         // Do not retry non-GET methods, their result may be not idempotent
         if (request().method() != "GET") return false
 
-        return  code == HttpURLConnection.HTTP_CLIENT_TIMEOUT ||
+        return code == HttpURLConnection.HTTP_CLIENT_TIMEOUT ||
                 code == HttpURLConnection.HTTP_INTERNAL_ERROR ||
                 code == HttpURLConnection.HTTP_BAD_GATEWAY ||
                 code == HttpURLConnection.HTTP_UNAVAILABLE ||
@@ -93,7 +99,7 @@ private fun selectRestApiCountForPagedRequests(limitResults: Int?, pageSize: Int
 }
 
 internal class TeamCityInstanceImpl(override val serverUrl: String,
-                                    val authMethod: String,
+                                    val authMethod: TeamcityAuthMethod,
                                     private val basicAuthHeader: String?,
                                     logResponses: Boolean,
                                     timeout: Long = 2,
@@ -113,13 +119,11 @@ internal class TeamCityInstanceImpl(override val serverUrl: String,
 
     internal val service = RestAdapter.Builder()
             .setClient(Ok3Client(client))
-            .setEndpoint("$serverUrl/$authMethod")
-            .setLog { restLog.debug(if (basicAuthHeader != null) it.replace(basicAuthHeader, "[REDACTED]") else it) }
+            .setEndpoint(authMethod.endpoint(serverUrl))
+            .setLog { restLog.debug(if (authMethod == TeamcityAuthMethod.HTTP_AUTH) it.replace(basicAuthHeader!!, "[REDACTED]") else it) }
             .setLogLevel(if (logResponses) RestAdapter.LogLevel.FULL else RestAdapter.LogLevel.HEADERS_AND_ARGS)
             .setRequestInterceptor { request ->
-                if (basicAuthHeader != null) {
-                    request.addHeader("Authorization", "Basic $basicAuthHeader")
-                }
+                authMethod.getRequestInterceptor(request, basicAuthHeader)
             }
             .setErrorHandler { retrofitError ->
                 val responseText = try {
@@ -199,21 +203,47 @@ internal class TeamCityInstanceImpl(override val serverUrl: String,
     override fun testRuns(): TestRunsLocator = TestRunsLocatorImpl(this)
 }
 
+
+internal enum class TeamcityAuthMethod {
+    HTTP_AUTH {
+        override fun endpoint(serverUrl: String) = "$serverUrl/httpAuth"
+        override fun getRequestInterceptor(request: RequestInterceptor.RequestFacade, authHeader: String?) {
+                request.addHeader("Authorization", "Basic $authHeader")
+        }
+    },
+    GUEST_AUTH {
+        override fun endpoint(serverUrl: String) = "$serverUrl/guestAuth"
+        override fun getRequestInterceptor(request: RequestInterceptor.RequestFacade, authHeader: String?) {
+            request.addHeader("Authorization", "Basic $authHeader")
+        }
+    },
+    ACCESS_TOKEN {
+        override fun endpoint(serverUrl: String) = serverUrl
+        override fun getRequestInterceptor(request: RequestInterceptor.RequestFacade, authHeader: String?) {
+            request.addHeader("Authorization", "Bearer $authHeader")
+        }
+    };
+
+    abstract fun endpoint(serverUrl: String): String
+    abstract fun getRequestInterceptor(request: RequestInterceptor.RequestFacade, authHeader: String?)
+
+}
+
 private fun <T> List<T>.toSequence(): Sequence<T> = object : Sequence<T> {
     override fun iterator(): Iterator<T> = this@toSequence.iterator()
 }
 
-private class BuildAgentLocatorImpl(private val instance: TeamCityInstanceImpl): BuildAgentLocator {
+private class BuildAgentLocatorImpl(private val instance: TeamCityInstanceImpl) : BuildAgentLocator {
     override fun all(): Sequence<BuildAgent> =
-        instance.service.agents().agent.map { BuildAgentImpl(it, false, instance) }.toSequence()
+            instance.service.agents().agent.map { BuildAgentImpl(it, false, instance) }.toSequence()
 }
 
-private class BuildAgentPoolLocatorImpl(private val instance: TeamCityInstanceImpl): BuildAgentPoolLocator {
+private class BuildAgentPoolLocatorImpl(private val instance: TeamCityInstanceImpl) : BuildAgentPoolLocator {
     override fun all(): Sequence<BuildAgentPool> =
-        instance.service.agentPools().agentPool.map { BuildAgentPoolImpl(it, false, instance) }.toSequence()
+            instance.service.agentPools().agentPool.map { BuildAgentPoolImpl(it, false, instance) }.toSequence()
 }
 
-private class UserLocatorImpl(private val instance: TeamCityInstanceImpl): UserLocator {
+private class UserLocatorImpl(private val instance: TeamCityInstanceImpl) : UserLocator {
     private var id: UserId? = null
     private var username: String? = null
 
@@ -395,8 +425,8 @@ private class BuildLocatorImpl(private val instance: TeamCityInstanceImpl) : Bui
                 if (pinnedOnly) "pinned:true" else null,
                 count?.let { "count:$it" },
 
-                since?.let {"sinceDate:${teamCityServiceDateFormat.withZone(ZoneOffset.UTC).format(it)}"},
-                until?.let {"untilDate:${teamCityServiceDateFormat.withZone(ZoneOffset.UTC).format(it)}"},
+                since?.let { "sinceDate:${teamCityServiceDateFormat.withZone(ZoneOffset.UTC).format(it)}" },
+                until?.let { "untilDate:${teamCityServiceDateFormat.withZone(ZoneOffset.UTC).format(it)}" },
 
                 if (!includeAllBranches)
                     branch?.let { "branch:$it" }
@@ -457,7 +487,7 @@ private class InvestigationLocatorImpl(private val instance: TeamCityInstanceImp
     }
 
     override fun all(): Sequence<Investigation> {
-        var investigationLocator : String? = null
+        var investigationLocator: String? = null
 
         val parameters = listOfNotNull(
                 limitResults?.let { "count:$it" },
@@ -492,7 +522,7 @@ private class TestRunsLocatorImpl(private val instance: TeamCityInstanceImpl) : 
     }
 
     override fun pageSize(pageSize: Int): TestRunsLocator {
-        this.pageSize= pageSize
+        this.pageSize = pageSize
         return this
     }
 
@@ -610,12 +640,12 @@ private class InvestigationImpl(
     override val state: InvestigationState
         get() = notNull { it.state }
     override val assignee: User
-        get() = UserImpl( notNull { it.assignee }, false, instance)
+        get() = UserImpl(notNull { it.assignee }, false, instance)
     override val reporter: User?
         get() {
             val assignment = nullable { it.assignment } ?: return null
             val userBean = assignment.user ?: return null
-            return UserImpl( userBean, false, instance)
+            return UserImpl(userBean, false, instance)
         }
     override val comment: String
         get() = notNull { it.assignment?.text ?: "" }
@@ -632,17 +662,17 @@ private class InvestigationImpl(
         }
     override val targetType: InvestigationTargetType
         get() {
-            val target = notNull { it.target}
+            val target = notNull { it.target }
             if (target.tests != null) return InvestigationTargetType.TEST
             if (target.problems != null) return InvestigationTargetType.BUILD_PROBLEM
             return InvestigationTargetType.BUILD_CONFIGURATION
         }
 
     override val testIds: List<TestId>?
-        get() = nullable { it.target?.tests?.test?.map { x -> TestId(notNull { x.id })} }
+        get() = nullable { it.target?.tests?.test?.map { x -> TestId(notNull { x.id }) } }
 
     override val problemIds: List<BuildProblemId>?
-        get() = nullable { it.target?.problems?.problem?.map { x -> BuildProblemId(notNull { x.id })} }
+        get() = nullable { it.target?.problems?.problem?.map { x -> BuildProblemId(notNull { x.id }) } }
 
     override val scope: InvestigationScope
         get() {
@@ -924,6 +954,7 @@ private class ChangeImpl(bean: ChangeBean,
                     specificBuildConfigurationId = specificBuildConfigurationId,
                     includePersonalBuilds = includePersonalBuilds
             )
+
     override val date: Date
         get() = Date.from(dateTime.toInstant())
 }
@@ -1001,10 +1032,10 @@ private class FinishBuildTriggerImpl(private val bean: TriggerBean) : FinishBuil
 
     private val branchPatterns: List<String>
         get() = bean.properties
-                    ?.property
-                    ?.find { it.name == "branchFilter" }
-                    ?.value
-                    ?.split(" ").orEmpty()
+                ?.property
+                ?.find { it.name == "branchFilter" }
+                ?.value
+                ?.split(" ").orEmpty()
 
     override val includedBranchPatterns: Set<String>
         get() = branchPatterns.filter { !it.startsWith("-:") }.mapTo(HashSet()) { it.substringAfter(":") }
@@ -1028,7 +1059,7 @@ private class ArtifactDependencyImpl(bean: ArtifactDependencyBean,
         get() = BuildConfigurationImpl(notNull { it.`source-buildType` }, false, instance)
 
     override val branch: String?
-        get () = findPropertyByName("revisionBranch")
+        get() = findPropertyByName("revisionBranch")
 
     override val artifactRules: List<ArtifactRule>
         get() = findPropertyByName("pathRules")!!.split(' ').map { ArtifactRuleImpl(it) }
@@ -1050,7 +1081,7 @@ private class BuildProblemImpl(private val bean: BuildProblemBean) : BuildProble
         get() = bean.identity!!
 
     override fun toString(): String =
-        "BuildProblem(id=${id.stringId},type=$type,identity=$identity)"
+            "BuildProblem(id=${id.stringId},type=$type,identity=$identity)"
 }
 
 private class BuildProblemOccurrenceImpl(private val bean: BuildProblemOccurrenceBean,
@@ -1065,7 +1096,7 @@ private class BuildProblemOccurrenceImpl(private val bean: BuildProblemOccurrenc
         get() = bean.additionalData
 
     override fun toString(): String =
-        "BuildProblemOccurrence(build=${build.id},problem=$buildProblem,details=$details,additionalData=$additionalData)"
+            "BuildProblemOccurrence(build=${build.id},problem=$buildProblem,details=$details,additionalData=$additionalData)"
 }
 
 internal class ArtifactRuleImpl(private val pathRule: String) : ArtifactRule {
@@ -1199,8 +1230,9 @@ private class BuildImpl(bean: BuildBean,
 
     override val pinInfo get() = fullBean.pinInfo?.let { PinInfoImpl(it, instance) }
     override val triggeredInfo get() = fullBean.triggered?.let { TriggeredImpl(it, instance) }
-    override val snapshotDependencies: List<Build> get() =
-        fullBean.`snapshot-dependencies`?.build?.map { BuildImpl(it, false, instance) } ?: emptyList()
+    override val snapshotDependencies: List<Build>
+        get() =
+            fullBean.`snapshot-dependencies`?.build?.map { BuildImpl(it, false, instance) } ?: emptyList()
 
     override fun tests(status: TestStatus?): Sequence<TestRun> = testRuns(status)
 
@@ -1360,7 +1392,7 @@ private class BuildImpl(bean: BuildBean,
         get() = finishDateTime?.let { Date.from(it.toInstant()) }
 }
 
-private class BuildRunningInfoImpl(private val bean: BuildRunningInfoBean): BuildRunningInfo {
+private class BuildRunningInfoImpl(private val bean: BuildRunningInfoBean) : BuildRunningInfo {
     override val percentageComplete: Int
         get() = bean.percentageComplete
     override val elapsedSeconds: Long
@@ -1374,7 +1406,7 @@ private class BuildRunningInfoImpl(private val bean: BuildRunningInfoBean): Buil
 }
 
 private class BuildCommentInfoImpl(private val bean: BuildCommentBean,
-                                   private val instance: TeamCityInstanceImpl): BuildCommentInfo {
+                                   private val instance: TeamCityInstanceImpl) : BuildCommentInfo {
     override val timestamp: ZonedDateTime
         get() = ZonedDateTime.parse(bean.timestamp!!, teamCityServiceDateFormat)
     override val user: User?
@@ -1436,8 +1468,8 @@ private class BuildAgentPoolImpl(bean: BuildAgentPoolBean,
 }
 
 private class BuildAgentImpl(bean: BuildAgentBean,
-                                 isFullBean: Boolean,
-                                 instance: TeamCityInstanceImpl) :
+                             isFullBean: Boolean,
+                             instance: TeamCityInstanceImpl) :
         BaseImpl<BuildAgentBean>(bean, isFullBean, instance), BuildAgent {
 
     override fun fetchFullBean(): BuildAgentBean = instance.service.agents("id:$idString")
@@ -1540,7 +1572,7 @@ private class BuildArtifactImpl(
     }
 }
 
-private class BuildQueueImpl(private val instance: TeamCityInstanceImpl): BuildQueue {
+private class BuildQueueImpl(private val instance: TeamCityInstanceImpl) : BuildQueue {
     override fun removeBuild(id: BuildId, comment: String, reAddIntoQueue: Boolean) {
         val request = BuildCancelRequestBean()
         request.comment = comment
@@ -1564,10 +1596,10 @@ private class BuildQueueImpl(private val instance: TeamCityInstanceImpl): BuildQ
     }
 }
 
-private fun getNameValueProperty(properties: List<NameValueProperty>, name: String): String? = properties.singleOrNull { it.name == name}?.value
+private fun getNameValueProperty(properties: List<NameValueProperty>, name: String): String? = properties.singleOrNull { it.name == name }?.value
 
 @Suppress("DEPRECATION")
-private open class TestOccurrenceImpl(bean: TestOccurrenceBean): TestOccurrence {
+private open class TestOccurrenceImpl(bean: TestOccurrenceBean) : TestOccurrence {
     override val name = bean.name!!
 
     final override val status = when {

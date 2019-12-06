@@ -29,4 +29,8 @@ object TeamCityInstanceFactory {
   @JvmStatic
   fun httpAuth(serverUrl: String, username: String, password: String): TeamCityInstance
           = createHttpAuthInstance(serverUrl, username, password)
+
+  @JvmStatic
+  fun accessTokenAuth(serverUrl: String, accessToken: String): TeamCityInstance
+          = createAccessTokenAuthInstance(serverUrl, accessToken)
 }
